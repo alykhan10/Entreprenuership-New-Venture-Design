@@ -1,0 +1,6 @@
+[submodule "WhisperLive"]
+	path = WhisperLive
+	url = https://github.com/cjohst/WhisperLive.git
+[submodule "libs/WhisperLive"]
+	path = libs/WhisperLive
+	url = https://github.com/cjohst/WhisperLive.git
