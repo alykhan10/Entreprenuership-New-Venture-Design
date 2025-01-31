@@ -1,4 +1,8 @@
 import os
+import sys
+
+sys.path.append(os.path.join(os.path.dirname(__file__), 'libs', 'WhisperLive'))
+
 import google.generativeai as genai
 from whisper_live.client import TranscriptionClient
 from dotenv import load_dotenv
@@ -47,6 +51,8 @@ class ControlService:
 
         prompt = f"""
             You are a highly skilled medical assistant. Your task is to analyze transcribed text and determine if it contains a direct request for one of the following tools: {', '.join(TOOLS)}.
+
+            Commands issues to you will start with the command phrase "robot". While you should not ignore commands not containing this phrase, pay special attention to commands containing the word "robot".
 
             A direct request means the speaker is asking for one of the tools to be provided to them or is indicating that they need one of the tools to be given to them. A request is usually expressed using phrases like "get me", "hand me", "give me", "I need", "can you bring". 
             A mere mention of a tool does NOT constitute a request. You should ignore casual chatter or background conversation. Pay close attention to the intent of the speaker. 
