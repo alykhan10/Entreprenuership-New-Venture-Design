@@ -1,0 +1,24 @@
+FROM python:3.8-slim-buster
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    sudo \
+    git \
+    bzip2 \
+    libx11-6 \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY scripts/setup.sh requirements/server.txt /app/
+
+RUN apt update && bash setup.sh && pip install -r server.txt
+
+COPY whisper_live /app/whisper_live
+COPY run_server.py /app
+
+CMD ["python", "run_server.py"]
