@@ -8,8 +8,12 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'libs', 'WhisperLive'))
 import google.generativeai as genai
 import serial
 from whisper_live.client import TranscriptionClient
+from libs.classify.classify import create_model
 from dotenv import load_dotenv
 from enum import Enum
+from PIL import Image
+import torch
+from torchvision import transforms
 
 class EnvironmentLoader:
     @staticmethod
@@ -27,10 +31,10 @@ class CommandType(Enum):
     NOT_A_REQUEST = "not_a_request"
 
 class Tool(Enum):
-    STRAIGHT_MAYO_SCISSOR = "straight mayo scissor"
-    CURVED_MAYO_SCISSOR = "curved mayo scissor"
+    STRAIGHT_MAYO_SCISSOR = "straight_mayo_scissor"
+    CURVED_MAYO_SCISSOR = "curved mayo_scissor"
     SCALPEL = "scalpel"
-    DISSECTION_CLAMP = "dissection clamp"
+    DISSECTION_CLAMP = "dissection_clamp"
 
 class ToolInventory:
     def __init__(self):
@@ -51,6 +55,13 @@ class ToolInventory:
             return True
         return False
     
+    def print_inventory(self):
+        print("=== TOOL INVENTORY STATUS ===")
+        for tool in Tool:
+            status = "IN" if self.inventory[tool] else "OUT"
+            print(f"{tool.value}: {status}")
+        print("===========================")
+    
 class Command:
     def __init__(self, command_string):
         if command_string == "not a request":
@@ -62,12 +73,17 @@ class Command:
         if len(parts) != 2:
             raise ValueError(f"Invalid command string: {command_string}")
         
-        tool, command = parts
-        self.tool = Tool(tool)
-        self.command_type = CommandType(command)
+        tool, command = parts[0], parts[1]
+        self.tool = Tool(tool.strip())  # Ensure valid tool
+        self.command_type = CommandType(command.strip())  # Ensure valid command type
 
     def __str__(self):
-        return f"{self.tool.value} {self.command_type.value}"
+        # Safely handle None tool
+        tool_value = self.tool.value if self.tool else "no tool"
+        command_value = self.command_type.value if self.command_type else "no command"
+        return f"{tool_value} {command_value}"
+
+
 
 class ToolLocations:
     DISPENSE_LOCATIONS = {
@@ -111,7 +127,7 @@ class CameraManager:
         self.cap.release()
         
 class ToolClassifier:
-    MODEL_PATH = os.path.join(os.path.dirname(__file__), '..', 'classify', 'tool_classifier.pth')
+    MODEL_PATH = os.path.join(os.path.dirname(__file__), 'libs', 'classify', 'tool_classifier.pth')
     CLASS_NAMES = ["curved-mayo-scissor", "dissection-clamp", "scalpel", "straight-mayo-scissor"]
     TARGET_SIZE = (256, 144)
     
@@ -151,7 +167,8 @@ class ToolClassifier:
         # Convert from BGR to RGB
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # Convert to PIL Image
+        # Convert to PIL 
+        
         image = Image.fromarray(image)
         
         # Define the transformation pipeline
@@ -197,9 +214,11 @@ class CommandClassifier:
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-1.5-flash-8b')
 
-    def classify(self, transcribed_text) -> Command:
+    def classify_text(self, transcribed_text) -> Command:
         transcribed_text = transcribed_text.lower().translate(str.maketrans("", "", string.punctuation)).strip()
-
+        print(f"transcribed text {transcribed_text}")
+        
+        tool_names = [tool.value for tool in Tool]  # Get list of tool names as strings
         prompt = f"""
         Prompt:
         You are an AI that extracts valid tool requests from transcribed speech. Your task is to determine whether the transcription contains a command to dispense or return a tool.
@@ -208,7 +227,7 @@ class CommandClassifier:
         1. The phrase **must contain** the word **"robot"** (case-insensitive).
         2. The word **"dispense"** or **"return"** must follow "robot" at some point in the transcription.
         3. One of the following tool names must appear after the command:  
-        {Tool.TOOLS}
+        {tool_names}
 
         Ignore extra words before "robot" or between the required words. Commands may have minor typos or extra punctuation. If a valid command is repeated multiple times, process it as a single request.
 
@@ -224,7 +243,7 @@ class CommandClassifier:
         **Output:** "scalpel dispense"  
 
         **Input:** "robot return curved mayo scissor!"  
-        **Output:** "curved mayo scissor return"  
+        **Output:** "curved_mayo_scissor return"  
 
         **Input:** "Yeah robot dispense scalpel"  
         **Output:** "scalpel dispense"  
@@ -238,16 +257,23 @@ class CommandClassifier:
         **Input:** "dispense scalpel, robot."  
         **Output:** "not a request"  
 
+        **Input:** "robot, dispense dissection clamp"
+        **Output:** "dissection_clamp dispense"
+
         Process the following transcription accordingly:  
         "{transcribed_text}"
         """
         try:
             response = self.model.generate_content(prompt)
-            result = response.text.strip().lower()
+            result = response.text.replace("`", "").replace("'","").replace('"',"").strip().lower()
+            print("Response", result)
+            
+            # Now, create a Command object from the response
             return Command(result)
         except Exception as e:
             print(f"Error during API call: {e}")
             return Command("not a request")
+
         
 
 class SerialCommunicator:
@@ -293,16 +319,22 @@ class ControlService:
             self.client.client.paused = True
 
             # Send the transcribed text to the LLM
-            response = self.tool_classifier.classify(text[-1])
+            print("GOT TEXT")
+            response = self.tool_classifier.classify_text(text[-1])
             print(f"Transcribed Text: {text[-1]}\n LLM Response: {response}")
             self.execute_command(response)
             self.client.client.paused = False
 
     def execute_command(self, command: Command):
         if command.command_type != CommandType.NOT_A_REQUEST:
+
+            print("Before command execution:")
+            self.tool_inventory.print_inventory()
+
             if command.command_type == CommandType.DISPENSE:
                 if self.tool_inventory.dispense_tool(command.tool):
                     location = ToolLocations.get_location(command)
+                    print(location)
                     self.serial_communicator.send(location)
                 else:
                     print(f"Error: Tool {command.tool.value} is already dispensed.")
@@ -329,7 +361,7 @@ class ControlService:
                             command.tool = out_tool
                         else:
                             print("No tools are marked as out. Using classified tool anyway.")
-                            command.tool = classified_tool
+                            return
                     else:
                         # Normal case - the classified tool is out according to inventory
                         command.tool = classified_tool
@@ -341,7 +373,7 @@ class ControlService:
                         print(f"Tool {command.tool.value} successfully returned.")
                     else:
                         print(f"Error: Tool {command.tool.value} is already returned.")
-                        
+
                 except Exception as e:
                     print(f"Tool classification failed: {e}")
                     # Even if classification fails, try to return a tool if one is out
@@ -359,6 +391,9 @@ class ControlService:
                         self.serial_communicator.send(location)
                     else:
                         print("Classification failed and no tools are marked as out. Cannot proceed.")
+                
+            print("After command execution:")
+            self.tool_inventory.print_inventory()
                         
     def start(self):
         # Start the transcription client
@@ -366,12 +401,45 @@ class ControlService:
 
 if __name__ == "__main__":
     control_service = ControlService()
-    # serial_comm = SerialCommunicator()
-    # while True:
-    #     if serial_comm.ser.in_waiting > 0:
-    #         line = serial_comm.ser.readline().decode('utf-8').rstrip()
-    #         print(line)
-    #         if line == "Homing complete. Waiting for commands (D1-D4, R1-R4)":
+    serial_comm = SerialCommunicator()
+
+    # def send_command_based_on_input(serial_comm):
+    #     print("Enter '1' for R1, '2' for R2, '3' for R3, '4' for R4")
+    #     print("Enter '5' for D1, '6' for D2, '7' for D3, '8' for D4")
+    #     print("Enter 'q' to quit")
+        
+    #     while True:
+    #         user_input = input("Enter command: ").strip()
+    #         if user_input == '1':
+    #             serial_comm.send("R1")
+    #             print("Sent: R1")
+    #         elif user_input == '2':
+    #             serial_comm.send("R2")
+    #             print("Sent: R2")
+    #         elif user_input == '3':
+    #             serial_comm.send("R3")
+    #             print("Sent: R3")
+    #         elif user_input == '4':
+    #             serial_comm.send("R4")
+    #             print("Sent: R4")
+    #         elif user_input == '5':
+    #             serial_comm.send("D1")
+    #             print("Sent: D1")
+    #         elif user_input == '6':
+    #             serial_comm.send("D2")
+    #             print("Sent: D2")
+    #         elif user_input == '7':
+    #             serial_comm.send("D3")
+    #             print("Sent: D3")
+    #         elif user_input == '8':
+    #             serial_comm.send("D4")
+    #             print("Sent: D4")
+    #         elif user_input == 'q':
+    #             print("Exiting...")
     #             break
-    
+    #         else:
+    #             print("Invalid input, please try again.")
+            
+    # send_command_based_on_input(serial_comm)
+
     control_service.start()

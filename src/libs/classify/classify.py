@@ -1,10 +1,17 @@
+import os
+import sys
+
 import torch
 from torchvision import transforms
 from PIL import Image
-from model import create_model  # Import your model creation function
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from .model import create_model  # Import your model creation function
 import cv2  # Import OpenCV
-import os
 import time
+
+
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
