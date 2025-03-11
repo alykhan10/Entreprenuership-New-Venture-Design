@@ -3,6 +3,8 @@ from torchvision import transforms
 from PIL import Image
 from model import create_model  # Import your model creation function
 import cv2  # Import OpenCV
+import os
+import time
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -67,39 +69,40 @@ def main():
         print("Error: Could not open camera.")
         return
     
-    print("Press 'c' to capture an image, 'q' to quit.")
+    print("Running in headless mode.")
+    print("Press Ctrl+C to exit.")
     
-    while True:
-        # Capture frame-by-frame
-        ret, frame = cap.read()
-        if not ret:
-            print("Error: Failed to capture image.")
-            break
-        
-        # Display the frame
-        cv2.imshow("Camera", frame)
-        
-        # Wait for key press
-        key = cv2.waitKey(1) & 0xFF
-        
-        # Capture image on 'c' key press
-        if key == ord('c'):
+    # Create a directory for saving images if it doesn't exist
+    save_dir = "captured_images"
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    
+    try:
+        while True:
+            # Capture frame-by-frame
+            ret, frame = cap.read()
+            if not ret:
+                print("Error: Failed to capture image.")
+                break
+            
             # Classify the captured image
             predicted_class = classify_image(model, frame, class_names)
             print(f"Predicted Class: {predicted_class}")
             
-            # Display the prediction on the frame
-            cv2.putText(frame, f"Predicted: {predicted_class}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.imshow("Prediction", frame)
-        
-        # Quit on 'q' key press
-        elif key == ord('q'):
-            break
+            # Save the image with timestamp and prediction
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            filename = f"{save_dir}/{timestamp}_{predicted_class}.jpg"
+            cv2.imwrite(filename, frame)
+            print(f"Image saved as {filename}")
+            
+            # Wait before the next capture
+            time.sleep(5)  # Capture every 5 seconds
     
-    # Release the camera and close windows
+    except KeyboardInterrupt:
+        print("Program interrupted by user. Exiting...")
+    
+    # Release the camera
     cap.release()
-    cv2.destroyAllWindows()
 
 # Run the main function
 if __name__ == "__main__":

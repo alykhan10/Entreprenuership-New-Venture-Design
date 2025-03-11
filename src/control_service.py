@@ -111,9 +111,86 @@ class CameraManager:
         self.cap.release()
         
 class ToolClassifier:
+    MODEL_PATH = os.path.join(os.path.dirname(__file__), '..', 'classify', 'tool_classifier.pth')
+    CLASS_NAMES = ["curved-mayo-scissor", "dissection-clamp", "scalpel", "straight-mayo-scissor"]
+    TARGET_SIZE = (256, 144)
+    
+    def __init__(self):
+        # Set device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+        
+        # Load model
+        try:
+            self.model = self.load_model(self.MODEL_PATH)
+            print("Model loaded successfully")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            raise
+        
+        # Create mapping from class names to Tool enum
+        self.class_to_tool = {
+            "curved-mayo-scissor": Tool.CURVED_MAYO_SCISSOR,
+            "straight-mayo-scissor": Tool.STRAIGHT_MAYO_SCISSOR,
+            "scalpel": Tool.SCALPEL,
+            "dissection-clamp": Tool.DISSECTION_CLAMP
+        }
+    
+    def load_model(self, model_path, num_classes=4):
+        model = create_model(num_classes=num_classes).to(self.device)
+        model.load_state_dict(torch.load(model_path, map_location=self.device))
+        model.eval()  # Set the model to evaluation mode
+        return model
+        
+    def preprocess_image(self, image_path):
+        # Load image using OpenCV
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Could not read image at {image_path}")
+            
+        # Convert from BGR to RGB
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Convert to PIL Image
+        image = Image.fromarray(image)
+        
+        # Define the transformation pipeline
+        transform = transforms.Compose([
+            transforms.Resize(self.TARGET_SIZE),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        # Apply transformations and add batch dimension
+        image_tensor = transform(image).unsqueeze(0).to(self.device)
+        return image_tensor
+    
     def classify_tool_from_photo(self, photo_path):
-        # TODO: Implement tool classification logic here
-        return Tool.SCALPEL  # TODO: Replace with actual classification logic
+        try:
+            # Check if the file exists
+            if not os.path.exists(photo_path):
+                raise FileNotFoundError(f"Image file not found: {photo_path}")
+                
+            # Preprocess the image
+            image_tensor = self.preprocess_image(photo_path)
+            
+            # Perform inference
+            with torch.no_grad():
+                output = self.model(image_tensor)
+                _, predicted = torch.max(output, 1)
+                predicted_class_idx = predicted.item()
+            
+            # Get the class name
+            predicted_class_name = self.CLASS_NAMES[predicted_class_idx]
+            print(f"Classified tool: {predicted_class_name}")
+            
+            # Convert to Tool enum
+            tool = self.class_to_tool[predicted_class_name]
+            return tool
+            
+        except Exception as e:
+            print(f"Error during classification: {e}")
+            raise  # Re-raise the exception to be handled by the caller
     
 class CommandClassifier:
     def __init__(self, api_key):
@@ -231,27 +308,70 @@ class ControlService:
                     print(f"Error: Tool {command.tool.value} is already dispensed.")
             elif command.command_type == CommandType.RETURN:
                 self.camera_manager.take_photo()
-                # Classify the photo to determine the tool
-                tool = self.tool_photo_classifier.classify_tool_from_photo(CameraManager.PHOTO_PATH)
-                command.tool = tool
-                if self.tool_inventory.return_tool(command.tool):
-                    location = ToolLocations.get_location(command)
-                    self.serial_communicator.send(location)
-                else:
-                    print(f"Error: Tool {command.tool.value} is already returned.")
-
+                try:
+                    # Classify the photo to determine the tool
+                    classified_tool = self.tool_photo_classifier.classify_tool_from_photo(CameraManager.PHOTO_PATH)
+                    print(f"Classified tool: {classified_tool.value}")
+                    
+                    # Check if the classified tool is already marked as returned in inventory
+                    if self.tool_inventory.is_tool_in(classified_tool):
+                        print(f"Warning: Classified tool {classified_tool.value} is already marked as in.")
+                        
+                        # Find a tool that's actually out to return instead
+                        out_tool = None
+                        for tool in Tool:
+                            if not self.tool_inventory.is_tool_in(tool):
+                                out_tool = tool
+                                break
+                        
+                        if out_tool:
+                            print(f"Using {out_tool.value} instead since it's marked as out.")
+                            command.tool = out_tool
+                        else:
+                            print("No tools are marked as out. Using classified tool anyway.")
+                            command.tool = classified_tool
+                    else:
+                        # Normal case - the classified tool is out according to inventory
+                        command.tool = classified_tool
+                    
+                    # Now return the selected tool
+                    if self.tool_inventory.return_tool(command.tool):
+                        location = ToolLocations.get_location(command)
+                        self.serial_communicator.send(location)
+                        print(f"Tool {command.tool.value} successfully returned.")
+                    else:
+                        print(f"Error: Tool {command.tool.value} is already returned.")
+                        
+                except Exception as e:
+                    print(f"Tool classification failed: {e}")
+                    # Even if classification fails, try to return a tool if one is out
+                    out_tool = None
+                    for tool in Tool:
+                        if not self.tool_inventory.is_tool_in(tool):
+                            out_tool = tool
+                            break
+                    
+                    if out_tool:
+                        print(f"Classification failed but found tool marked as out: {out_tool.value}")
+                        command.tool = out_tool
+                        self.tool_inventory.return_tool(command.tool)
+                        location = ToolLocations.get_location(command)
+                        self.serial_communicator.send(location)
+                    else:
+                        print("Classification failed and no tools are marked as out. Cannot proceed.")
+                        
     def start(self):
         # Start the transcription client
         self.client()
 
 if __name__ == "__main__":
     control_service = ControlService()
-    serial_comm = SerialCommunicator()
-    while True:
-        if serial_comm.ser.in_waiting > 0:
-            line = serial_comm.ser.readline().decode('utf-8').rstrip()
-            print(line)
-            if line == "Homing complete. Waiting for commands (D1-D4, R1-R4)":
-                break
+    # serial_comm = SerialCommunicator()
+    # while True:
+    #     if serial_comm.ser.in_waiting > 0:
+    #         line = serial_comm.ser.readline().decode('utf-8').rstrip()
+    #         print(line)
+    #         if line == "Homing complete. Waiting for commands (D1-D4, R1-R4)":
+    #             break
     
     control_service.start()
