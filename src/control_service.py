@@ -1,445 +1,118 @@
-import os
-import sys
-import string
-import cv2
-
-sys.path.append(os.path.join(os.path.dirname(__file__), 'libs', 'WhisperLive'))
-
-import google.generativeai as genai
-import serial
-from whisper_live.client import TranscriptionClient
-from libs.classify.classify import create_model
-from dotenv import load_dotenv
-from enum import Enum
-from PIL import Image
-import torch
-from torchvision import transforms
-
-class EnvironmentLoader:
-    @staticmethod
-    def load():
-        load_dotenv()  
-        gemini_key = os.getenv("GOOGLE_API_KEY")
-        if not gemini_key:
-            print("Error: GOOGLE_API_KEY environment variable not set. Exiting.")
-            exit()
-        return gemini_key
-
-class CommandType(Enum):
-    DISPENSE = "dispense"
-    RETURN = "return"
-    NOT_A_REQUEST = "not_a_request"
-
-class Tool(Enum):
-    STRAIGHT_MAYO_SCISSOR = "straight_mayo_scissor"
-    CURVED_MAYO_SCISSOR = "curved mayo_scissor"
-    SCALPEL = "scalpel"
-    DISSECTION_CLAMP = "dissection_clamp"
-
-class ToolInventory:
-    def __init__(self):
-        self.inventory = {tool: True for tool in Tool}  # True means the tool is in, False means the tool is out
-
-    def is_tool_in(self, tool):
-        return self.inventory.get(tool, False)
-
-    def dispense_tool(self, tool):
-        if self.is_tool_in(tool):
-            self.inventory[tool] = False
-            return True
-        return False
-
-    def return_tool(self, tool):
-        if not self.is_tool_in(tool):
-            self.inventory[tool] = True
-            return True
-        return False
-    
-    def print_inventory(self):
-        print("=== TOOL INVENTORY STATUS ===")
-        for tool in Tool:
-            status = "IN" if self.inventory[tool] else "OUT"
-            print(f"{tool.value}: {status}")
-        print("===========================")
-    
-class Command:
-    def __init__(self, command_string):
-        if command_string == "not a request":
-            self.tool = None
-            self.command_type = CommandType.NOT_A_REQUEST
-            return
-        
-        parts = command_string.split()
-        if len(parts) != 2:
-            raise ValueError(f"Invalid command string: {command_string}")
-        
-        tool, command = parts[0], parts[1]
-        self.tool = Tool(tool.strip())  # Ensure valid tool
-        self.command_type = CommandType(command.strip())  # Ensure valid command type
-
-    def __str__(self):
-        # Safely handle None tool
-        tool_value = self.tool.value if self.tool else "no tool"
-        command_value = self.command_type.value if self.command_type else "no command"
-        return f"{tool_value} {command_value}"
-
-
-
-class ToolLocations:
-    DISPENSE_LOCATIONS = {
-        Tool.STRAIGHT_MAYO_SCISSOR: "D1",
-        Tool.CURVED_MAYO_SCISSOR: "D2",
-        Tool.SCALPEL: "D3",
-        Tool.DISSECTION_CLAMP: "D4"
-    }
-
-    RETURN_LOCATIONS = {
-        Tool.STRAIGHT_MAYO_SCISSOR: "R1",
-        Tool.CURVED_MAYO_SCISSOR: "R2",
-        Tool.SCALPEL: "R3",
-        Tool.DISSECTION_CLAMP: "R4"
-    }
-
-    @staticmethod
-    def get_location(command: Command):
-        if command.command_type == CommandType.DISPENSE:
-            return ToolLocations.DISPENSE_LOCATIONS[command.tool]
-        elif command.command_type == CommandType.RETURN:
-            return ToolLocations.RETURN_LOCATIONS[command.tool]
-        else:
-            raise ValueError(f"Invalid command type: {command.command_type}")
-        
-class CameraManager:
-    PHOTO_PATH = '/home/orobot/orobot/src/photo.jpg'
-    def __init__(self):
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            print("Error: Could not open camera.")
-            exit()
-
-    def take_photo(self):
-        ret, frame = self.cap.read()
-        if ret:
-            cv2.imwrite(self.PHOTO_PATH, frame)
-            print("Photo taken and saved as photo.jpg")
-        else:
-            print("Error: Could not read frame from camera.")
-        self.cap.release()
-        
-class ToolClassifier:
-    MODEL_PATH = os.path.join(os.path.dirname(__file__), 'libs', 'classify', 'tool_classifier.pth')
-    CLASS_NAMES = ["curved-mayo-scissor", "dissection-clamp", "scalpel", "straight-mayo-scissor"]
-    TARGET_SIZE = (256, 144)
-    
-    def __init__(self):
-        # Set device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {self.device}")
-        
-        # Load model
-        try:
-            self.model = self.load_model(self.MODEL_PATH)
-            print("Model loaded successfully")
-        except Exception as e:
-            print(f"Error loading model: {e}")
-            raise
-        
-        # Create mapping from class names to Tool enum
-        self.class_to_tool = {
-            "curved-mayo-scissor": Tool.CURVED_MAYO_SCISSOR,
-            "straight-mayo-scissor": Tool.STRAIGHT_MAYO_SCISSOR,
-            "scalpel": Tool.SCALPEL,
-            "dissection-clamp": Tool.DISSECTION_CLAMP
-        }
-    
-    def load_model(self, model_path, num_classes=4):
-        model = create_model(num_classes=num_classes).to(self.device)
-        model.load_state_dict(torch.load(model_path, map_location=self.device))
-        model.eval()  # Set the model to evaluation mode
-        return model
-        
-    def preprocess_image(self, image_path):
-        # Load image using OpenCV
-        image = cv2.imread(image_path)
-        if image is None:
-            raise ValueError(f"Could not read image at {image_path}")
-            
-        # Convert from BGR to RGB
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        # Convert to PIL 
-        
-        image = Image.fromarray(image)
-        
-        # Define the transformation pipeline
-        transform = transforms.Compose([
-            transforms.Resize(self.TARGET_SIZE),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        
-        # Apply transformations and add batch dimension
-        image_tensor = transform(image).unsqueeze(0).to(self.device)
-        return image_tensor
-    
-    def classify_tool_from_photo(self, photo_path):
-        try:
-            # Check if the file exists
-            if not os.path.exists(photo_path):
-                raise FileNotFoundError(f"Image file not found: {photo_path}")
-                
-            # Preprocess the image
-            image_tensor = self.preprocess_image(photo_path)
-            
-            # Perform inference
-            with torch.no_grad():
-                output = self.model(image_tensor)
-                _, predicted = torch.max(output, 1)
-                predicted_class_idx = predicted.item()
-            
-            # Get the class name
-            predicted_class_name = self.CLASS_NAMES[predicted_class_idx]
-            print(f"Classified tool: {predicted_class_name}")
-            
-            # Convert to Tool enum
-            tool = self.class_to_tool[predicted_class_name]
-            return tool
-            
-        except Exception as e:
-            print(f"Error during classification: {e}")
-            raise  # Re-raise the exception to be handled by the caller
-    
-class CommandClassifier:
-    def __init__(self, api_key):
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-1.5-flash-8b')
-
-    def classify_text(self, transcribed_text) -> Command:
-        transcribed_text = transcribed_text.lower().translate(str.maketrans("", "", string.punctuation)).strip()
-        print(f"transcribed text {transcribed_text}")
-        
-        tool_names = [tool.value for tool in Tool]  # Get list of tool names as strings
-        prompt = f"""
-        Prompt:
-        You are an AI that extracts valid tool requests from transcribed speech. Your task is to determine whether the transcription contains a command to dispense or return a tool.
-
-        ### Command Requirements:
-        1. The phrase **must contain** the word **"robot"** (case-insensitive).
-        2. The word **"dispense"** or **"return"** must follow "robot" at some point in the transcription.
-        3. One of the following tool names must appear after the command:  
-        {tool_names}
-
-        Ignore extra words before "robot" or between the required words. Commands may have minor typos or extra punctuation. If a valid command is repeated multiple times, process it as a single request.
-
-        ### Response Format:
-        - If a valid command is detected, return:  
-        **`"<tool> <command>"`** (all lowercase, separated by a space).  
-        - If no valid command is found, return exactly:  
-        **"not a request"**  
-
-        ### Examples:
-
-        **Input:** "robot, please dispense the scalpel."  
-        **Output:** "scalpel dispense"  
-
-        **Input:** "robot return curved mayo scissor!"  
-        **Output:** "curved_mayo_scissor return"  
-
-        **Input:** "Yeah robot dispense scalpel"  
-        **Output:** "scalpel dispense"  
-
-        **Input:** "Yeah, robot dispense scalpel robot dispense scalpel"  
-        **Output:** "scalpel dispense"  
-
-        **Input:** "robot retrieve the dissection clamp"  
-        **Output:** "not a request"  
-
-        **Input:** "dispense scalpel, robot."  
-        **Output:** "not a request"  
-
-        **Input:** "robot, dispense dissection clamp"
-        **Output:** "dissection_clamp dispense"
-
-        Process the following transcription accordingly:  
-        "{transcribed_text}"
-        """
-        try:
-            response = self.model.generate_content(prompt)
-            result = response.text.replace("`", "").replace("'","").replace('"',"").strip().lower()
-            print("Response", result)
-            
-            # Now, create a Command object from the response
-            return Command(result)
-        except Exception as e:
-            print(f"Error during API call: {e}")
-            return Command("not a request")
-
-        
-
-class SerialCommunicator:
-    DEVICE_NAME = "/dev/ttyUSB0"
-
-    def __init__(self):
-        self.ser = serial.Serial(self.DEVICE_NAME, 9600)
-        self.ser.reset_input_buffer()
-        self.ser.reset_output_buffer()
-
-    def send(self, location: str):
-        self.ser.write(location.encode('utf-8'))
-        # debug
-        while self.ser.in_waiting > 0:
-            line = self.ser.readline().decode('utf-8').rstrip()
-            print(line)
+from config import Tool, CommandType, PHOTO_PATH
+from models.tools import ToolInventory
+from models.commands import Command, ToolLocations
+from services.camera_service import CameraManager
+from services.serial_service import SerialCommunicator
+from services.voice_service import EnvironmentLoader, CommandClassifier, VoiceTranscriptionService
+from ml.tool_classifier import ToolClassifier
 
 class ControlService:
     def __init__(self):
-        self.GEMINI_KEY = EnvironmentLoader.load()
-        self.tool_classifier = CommandClassifier(self.GEMINI_KEY)
+        # Load API key
+        self.api_key = EnvironmentLoader.load()
+        if not self.api_key:
+            raise ValueError("Failed to load API key")
+        
+        # Initialize services
+        self.command_classifier = CommandClassifier(self.api_key)
         self.camera_manager = CameraManager()
         self.serial_communicator = SerialCommunicator()
-        self.tool_photo_classifier = ToolClassifier()
+        self.tool_classifier = ToolClassifier()
         self.tool_inventory = ToolInventory()
+        self.voice_service = VoiceTranscriptionService(self._process_transcription)
+    
+    def _process_transcription(self, text):
+        """Process transcribed text"""
+        print(f"Processing transcription: {text}")
+        command = self.command_classifier.classify_text(text)
+        self.execute_command(command)
+    
+    def execute_command(self, command):
+        """Main command execution logic"""
+        if command.command_type == CommandType.NOT_A_REQUEST:
+            print("Not a request. No action taken.")
+            return
 
-        # Initialize Transcription Client
-        self.client = TranscriptionClient(
-            host="localhost",
-            port=9090,
-            lang="en",
-            translate=False,
-            model="tiny.en",
-            use_vad=True,
-            callback=self.handle_transcription
-        )
+        print("Before command execution:")
+        self.tool_inventory.print_inventory()
 
-        self.last_text = ""
+        if command.command_type == CommandType.DISPENSE:
+            self._handle_dispense_command(command)
+        elif command.command_type == CommandType.RETURN:
+            self._handle_return_command()
 
-    def handle_transcription(self, text, is_final):
-        if is_final and text != self.last_text:
-            self.last_text = text
-            self.client.client.paused = True
-
-            # Send the transcribed text to the LLM
-            print("GOT TEXT")
-            response = self.tool_classifier.classify_text(text[-1])
-            print(f"Transcribed Text: {text[-1]}\n LLM Response: {response}")
-            self.execute_command(response)
-            self.client.client.paused = False
-
-    def execute_command(self, command: Command):
-        if command.command_type != CommandType.NOT_A_REQUEST:
-
-            print("Before command execution:")
-            self.tool_inventory.print_inventory()
-
-            if command.command_type == CommandType.DISPENSE:
-                if self.tool_inventory.dispense_tool(command.tool):
-                    location = ToolLocations.get_location(command)
-                    print(location)
-                    self.serial_communicator.send(location)
-                else:
-                    print(f"Error: Tool {command.tool.value} is already dispensed.")
-            elif command.command_type == CommandType.RETURN:
-                self.camera_manager.take_photo()
-                try:
-                    # Classify the photo to determine the tool
-                    classified_tool = self.tool_photo_classifier.classify_tool_from_photo(CameraManager.PHOTO_PATH)
-                    print(f"Classified tool: {classified_tool.value}")
+        print("After command execution:")
+        self.tool_inventory.print_inventory()
+    
+    def _handle_dispense_command(self, command):
+        """Handle tool dispensing logic"""
+        if self.tool_inventory.dispense_tool(command.tool):
+            location = ToolLocations.get_location(command)
+            print(f"Dispensing {command.tool.value} from {location}")
+            self.serial_communicator.send(location)
+        else:
+            print(f"Error: Tool {command.tool.value} is already dispensed.")
+    
+    def _handle_return_command(self):
+        """Handle tool return logic"""
+        # Take a photo to identify the tool
+        self.camera_manager.take_photo()
+        
+        try:
+            # Try to classify the tool from the photo
+            classified_tool = self._classify_and_get_return_tool()
+            if classified_tool:
+                # Create a return command with the classified tool
+                return_command = Command(f"{classified_tool.value} {CommandType.RETURN.value}")
+                location = ToolLocations.get_location(return_command)
+                self.serial_communicator.send(location)
+                print(f"Tool {classified_tool.value} successfully returned.")
+        except Exception as e:
+            print(f"Error handling return: {e}")
+    
+    def _classify_and_get_return_tool(self):
+        """Classify the tool in photo and determine which tool to return"""
+        try:
+            # Try to classify the tool from the photo
+            classified_tool = self.tool_classifier.classify_tool_from_photo(PHOTO_PATH)
+            print(f"Classified tool: {classified_tool.value}")
+            
+            # If the classified tool is marked as out, return it
+            if not self.tool_inventory.is_tool_in(classified_tool):
+                self.tool_inventory.return_tool(classified_tool)
+                return classified_tool
+            
+            print(f"Warning: Classified tool {classified_tool.value} is already marked as in.")
+            
+            # Find any tool that's marked as out
+            for tool in Tool:
+                if not self.tool_inventory.is_tool_in(tool):
+                    print(f"Using {tool.value} instead since it's marked as out.")
+                    self.tool_inventory.return_tool(tool)
+                    return tool
                     
-                    # Check if the classified tool is already marked as returned in inventory
-                    if self.tool_inventory.is_tool_in(classified_tool):
-                        print(f"Warning: Classified tool {classified_tool.value} is already marked as in.")
-                        
-                        # Find a tool that's actually out to return instead
-                        out_tool = None
-                        for tool in Tool:
-                            if not self.tool_inventory.is_tool_in(tool):
-                                out_tool = tool
-                                break
-                        
-                        if out_tool:
-                            print(f"Using {out_tool.value} instead since it's marked as out.")
-                            command.tool = out_tool
-                        else:
-                            print("No tools are marked as out. Using classified tool anyway.")
-                            return
-                    else:
-                        # Normal case - the classified tool is out according to inventory
-                        command.tool = classified_tool
-                    
-                    # Now return the selected tool
-                    if self.tool_inventory.return_tool(command.tool):
-                        location = ToolLocations.get_location(command)
-                        self.serial_communicator.send(location)
-                        print(f"Tool {command.tool.value} successfully returned.")
-                    else:
-                        print(f"Error: Tool {command.tool.value} is already returned.")
-
-                except Exception as e:
-                    print(f"Tool classification failed: {e}")
-                    # Even if classification fails, try to return a tool if one is out
-                    out_tool = None
-                    for tool in Tool:
-                        if not self.tool_inventory.is_tool_in(tool):
-                            out_tool = tool
-                            break
-                    
-                    if out_tool:
-                        print(f"Classification failed but found tool marked as out: {out_tool.value}")
-                        command.tool = out_tool
-                        self.tool_inventory.return_tool(command.tool)
-                        location = ToolLocations.get_location(command)
-                        self.serial_communicator.send(location)
-                    else:
-                        print("Classification failed and no tools are marked as out. Cannot proceed.")
-                
-            print("After command execution:")
-            self.tool_inventory.print_inventory()
+            print("No tools are marked as out. Cannot return anything.")
+            return None
+            
+        except Exception as e:
+            print(f"Tool classification failed: {e}")
+            # Even if classification fails, try to return any tool that's out
+            for tool in Tool:
+                if not self.tool_inventory.is_tool_in(tool):
+                    print(f"Classification failed but found tool marked as out: {tool.value}")
+                    self.tool_inventory.return_tool(tool)
+                    return tool
+            
+            print("Classification failed and no tools are marked as out. Cannot proceed.")
+            return None
                         
     def start(self):
-        # Start the transcription client
-        self.client()
-
-if __name__ == "__main__":
-    control_service = ControlService()
-    serial_comm = SerialCommunicator()
-
-    # def send_command_based_on_input(serial_comm):
-    #     print("Enter '1' for R1, '2' for R2, '3' for R3, '4' for R4")
-    #     print("Enter '5' for D1, '6' for D2, '7' for D3, '8' for D4")
-    #     print("Enter 'q' to quit")
+        """Start the control service"""
+        print("Initializing tool classifier...")
+        self.tool_classifier.initialize()
         
-    #     while True:
-    #         user_input = input("Enter command: ").strip()
-    #         if user_input == '1':
-    #             serial_comm.send("R1")
-    #             print("Sent: R1")
-    #         elif user_input == '2':
-    #             serial_comm.send("R2")
-    #             print("Sent: R2")
-    #         elif user_input == '3':
-    #             serial_comm.send("R3")
-    #             print("Sent: R3")
-    #         elif user_input == '4':
-    #             serial_comm.send("R4")
-    #             print("Sent: R4")
-    #         elif user_input == '5':
-    #             serial_comm.send("D1")
-    #             print("Sent: D1")
-    #         elif user_input == '6':
-    #             serial_comm.send("D2")
-    #             print("Sent: D2")
-    #         elif user_input == '7':
-    #             serial_comm.send("D3")
-    #             print("Sent: D3")
-    #         elif user_input == '8':
-    #             serial_comm.send("D4")
-    #             print("Sent: D4")
-    #         elif user_input == 'q':
-    #             print("Exiting...")
-    #             break
-    #         else:
-    #             print("Invalid input, please try again.")
-            
-    # send_command_based_on_input(serial_comm)
-
-    control_service.start()
+        print("Initializing serial communicator...")
+        self.serial_communicator.initialize()
+        
+        print("Starting voice transcription service...")
+        self.voice_service.start()
