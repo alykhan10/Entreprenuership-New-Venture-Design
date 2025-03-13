@@ -8,7 +8,6 @@ from config import Tool, MODEL_PATH, CLASS_NAMES, TARGET_SIZE
 
 class ToolClassifier:
     def __init__(self):
-        # Set device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         
@@ -67,11 +66,9 @@ class ToolClassifier:
                 raise RuntimeError("Tool classifier not initialized")
                 
         try:
-            # Check if the file exists
             if not os.path.exists(photo_path):
                 raise FileNotFoundError(f"Image file not found: {photo_path}")
                 
-            # Preprocess the image
             image_tensor = self._preprocess_image(photo_path)
             
             # Perform inference
@@ -90,4 +87,4 @@ class ToolClassifier:
             
         except Exception as e:
             print(f"Error during classification: {e}")
-            raise  # Re-raise the exception to be handled by the caller
+            raise e

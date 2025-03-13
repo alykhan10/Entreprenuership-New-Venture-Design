@@ -40,18 +40,17 @@ class CommandClassifier:
             "clamp": Tool.DISSECTION_CLAMP.value
         }
 
-    def classify_text(self, transcribed_text):
+    def classify_text(self, transcribed_text, last_cmd_type=None):
         # Clean the input text
         transcribed_text = transcribed_text.lower().translate(str.maketrans("", "", string.punctuation)).strip()
         print(f"Transcribed text: {transcribed_text}")
 
-        # NEW: Check for return command first since it takes priority
-        if "return" in transcribed_text and "robot" in transcribed_text:
+        # Only prioritize a RETURN command if the last command wasn’t already RETURN
+        if last_cmd_type != CommandType.RETURN and "return" in transcribed_text and "robot" in transcribed_text:
             print("Detected return command with priority")
             return Command("not_a_request return")
 
-        # Store the last processed text for better return command detection
-        self.last_processed_text = transcribed_text    
+        self.last_processed_text = transcribed_text 
         
         prompt = f"""
         Prompt:
@@ -81,7 +80,6 @@ class CommandClassifier:
         Process the following transcription:
         "{transcribed_text}"
         """
-    # Continue with the existing processing...
         try:
             response = self.model.generate_content(prompt)
             # Clean the LLM response by removing any markdown formatting, quotes, or backticks
@@ -89,30 +87,70 @@ class CommandClassifier:
             llm_response = llm_response.replace('```', '').replace('`', '').strip()
             print(f"LLM response: {llm_response}")
             
-            # Validate the LLM response
-            validated_command = self._validate_llm_response(llm_response)
+            validated_command = self._validate_llm_response(llm_response, last_cmd_type)
             return validated_command
             
         except Exception as e:
             print(f"Error classifying command: {e}")
             return Command("not a request")
     
-    def _validate_llm_response(self, llm_response):
+    
+    def _validate_llm_response(self, llm_response, last_cmd_type=None):
         """Validate and fix the LLM response to ensure it contains valid tools and commands"""
         
         # Clean the response of any potential formatting or extra characters
         llm_response = llm_response.strip().lower()
         
-        # If response is "not a request"
+        # First, check if both command types are present in the original text
+        has_return = "return" in self.last_processed_text.lower() and ("robot" in self.last_processed_text.lower() or "tool" in self.last_processed_text.lower())
+        dispense_keywords = ["scissor", "scalpel", "clamp", "mayo"]
+        has_dispense = any(dk in self.last_processed_text.lower() for dk in dispense_keywords) and "robot" in self.last_processed_text.lower()
+        
+        # If we have both command types, prioritize based on last command
+        if has_return and has_dispense:
+            if last_cmd_type == CommandType.RETURN:
+                # Last command was RETURN, so prioritize DISPENSE
+                print("Last command was RETURN - overriding to prioritize DISPENSE")
+                # Check if LLM found a valid dispense command
+                if "dispense" in llm_response and any(tool in llm_response for tool in self.valid_tools) or any(tool in llm_response for tool in self.tool_variations):
+                    # Continue with normal validation for dispense
+                    pass
+                else:
+                    # Force a check for dispense keywords
+                    for tool_var in self.tool_variations:
+                        if tool_var in self.last_processed_text.lower():
+                            print(f"Found tool in text: {tool_var}, creating dispense command")
+                            valid_tool = self.tool_variations[tool_var]
+                            return Command(f"{valid_tool} dispense")
+            else:
+                # Last command was DISPENSE or None, prioritize RETURN
+                if has_return:
+                    print("Last command was DISPENSE or None - overriding to prioritize RETURN")
+                    return Command("not_a_request return")
+        
         if llm_response == "not a request":
             # Double-check for potential missed return commands
-            if "return" in self.last_processed_text and "robot" in self.last_processed_text:
+            if has_return and last_cmd_type != CommandType.RETURN:
                 print("Response was 'not a request' but text contains 'robot' and 'return' - overriding to return command")
                 return Command("not_a_request return")
+            # Double-check for potential missed dispense commands when last command was RETURN
+            elif has_dispense and last_cmd_type == CommandType.RETURN:
+                for tool_var in self.tool_variations:
+                    if tool_var in self.last_processed_text.lower():
+                        print(f"Response was 'not a request' but found tool {tool_var} after RETURN - overriding to dispense command")
+                        valid_tool = self.tool_variations[tool_var]
+                        return Command(f"{valid_tool} dispense")
             return Command("not a request")
         
-        # Check for return command 
         if "return" in llm_response:
+            if last_cmd_type == CommandType.RETURN and has_dispense:
+                # Override to look for dispense if last command was return
+                print("LLM suggested RETURN but last command was already RETURN - checking for dispense instead")
+                for tool_var in self.tool_variations:
+                    if tool_var in self.last_processed_text.lower():
+                        print(f"Found tool in text: {tool_var}, creating dispense command")
+                        valid_tool = self.tool_variations[tool_var]
+                        return Command(f"{valid_tool} dispense")
             return Command("not_a_request return")
         
         # For dispense commands, ensure proper format and valid tool
@@ -150,15 +188,15 @@ class CommandClassifier:
         except Exception as e:
             print(f"Error during validation: {e}")
             return Command("not a request")
-
+        
 class VoiceTranscriptionService:
     def __init__(self, callback):
         self.client = None
         self.callback = callback
         self.last_command_time = 0
         self.command_cooldown = 3.0
-        self.last_processed_text = ""  # Store last processed text for deduplication
-        self.current_transcription = ""  # Keep track of the current transcription
+        self.last_processed_text = ""  
+        self.current_transcription = "" 
         
     def initialize(self):
         try:
@@ -181,9 +219,9 @@ class VoiceTranscriptionService:
         current_time = time.time()
         
         if isinstance(text, list):
-            if not text:  # Empty list
+            if not text:  
                 return
-            # Just use the last segment of text, which is typically the most recent
+            # Just use the last segment of text, which is the most recent
             text = text[-1]
         
         # Only process final transcriptions
@@ -211,44 +249,59 @@ class VoiceTranscriptionService:
         # This finds positions of all occurrences of "robot" in the text
         robot_positions = self._find_all_occurrences(latest_text.lower(), "robot")
         
-        # If we found more than one "robot" mention, we may have multiple commands
         if len(robot_positions) > 1:
-            # Split the text into potential separate commands
             commands = []
             for i in range(len(robot_positions)):
                 start_pos = robot_positions[i]
-                
-                # Determine end position (either next robot or end of string)
                 if i < len(robot_positions) - 1:
                     end_pos = robot_positions[i + 1]
                     cmd = latest_text[start_pos:end_pos].strip()
                 else:
                     cmd = latest_text[start_pos:].strip()
-                    
                 commands.append(cmd)
-                
-            # Special case: if the second command contains "return", prioritize it
-            if len(commands) >= 2 and "return" in commands[1].lower():
-                print("Found separate return command - prioritizing it over dispense")
-                latest_text = commands[1]
+            
+            # Identify if we have both a return command and a dispense request
+            has_return = any("return" in c.lower() for c in commands)
+            dispense_keywords = ["scissor", "scalpel", "clamp", "mayo"]
+            has_dispense = any(any(dk in c.lower() for dk in dispense_keywords) for c in commands)
+
+            # Prioritize the opposite of the last command type, if both exist
+            if has_return and has_dispense:
+                last_cmd_type = (self.control_service.get_last_command_type()
+                                 if self.control_service else None)
+                if last_cmd_type == CommandType.RETURN:
+                    print("Last command was RETURN - prioritizing DISPENSE this time")
+                    for cmd in commands:
+                        if any(dk in cmd.lower() for dk in dispense_keywords):
+                            latest_text = cmd
+                            break
+                else:
+                    print("Last command was DISPENSE or None - prioritizing RETURN this time")
+                    for cmd in commands:
+                        if "return" in cmd.lower():
+                            latest_text = cmd
+                            break
+            elif has_return:
+                print("Found return command - default prioritizing RETURN")
+                for cmd in commands:
+                    if "return" in cmd.lower():
+                        latest_text = cmd
+                        break
         
-        # Skip if this is too similar to the last processed text (likely duplicate)
+        # Skip if this is too similar to the last processed text
         if self._is_duplicate(latest_text, self.last_processed_text):
             print(f"Skipping duplicate command: '{latest_text}'")
             return
 
-        # Check if enough time has passed since the last command
         if current_time - self.last_command_time < self.command_cooldown:
             print(f"Command rejected - cooldown period ({self.command_cooldown}s) not elapsed")
             return
-        
-        # Process the command and update last command time
+
         print(f"\n======= PROCESSING NEW COMMAND: '{latest_text}' =======\n")
         self.last_command_time = current_time
-        self.last_processed_text = latest_text  # Save for deduplication
+        self.last_processed_text = latest_text
+
         self.callback(latest_text)
-        
-        # After processing a command, reset our current transcription to avoid reprocessing
         self.current_transcription = ""
         self.last_buffer_reset = current_time
 
@@ -297,7 +350,7 @@ class VoiceTranscriptionService:
                 
         try:
             print("Starting transcription client...")
-            self.client()  # Start the transcription client
+            self.client()  
             print("Transcription client started and running")
             return True
         except Exception as e:

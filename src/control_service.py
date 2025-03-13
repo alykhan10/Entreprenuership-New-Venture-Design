@@ -21,13 +21,14 @@ class ControlService:
         if not self.api_key:
             raise ValueError("Failed to load API key")
         
-        # Initialize services
         self.command_classifier = CommandClassifier(self.api_key)
         self.camera_manager = CameraManager()
         self.serial_communicator = SerialCommunicator()
         self.tool_classifier = ToolClassifier()
         self.tool_inventory = ToolInventory()
         self.voice_service = VoiceTranscriptionService(self._process_transcription)
+
+        self.last_command_type = None
         
         # Update shared state with initial inventory
         shared_state.update_inventory(self.tool_inventory)
@@ -62,6 +63,9 @@ class ControlService:
             self._handle_dispense_command(command)
         elif command.command_type == CommandType.RETURN:
             self._handle_return_command()
+
+        if command.command_type in [CommandType.DISPENSE, CommandType.RETURN]:
+            self.last_command_type = command.command_type
 
         print("After command execution:")
         self.tool_inventory.print_inventory()
@@ -145,7 +149,9 @@ class ControlService:
                 print(f"Executing command from web interface: {command}")
                 self.execute_command(command)
             time.sleep(0.1)
-                        
+    def get_last_command_type(self):
+        return self.last_command_type
+                            
     def start(self):
         """Start the control service"""
         print("Initializing tool classifier...")
