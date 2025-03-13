@@ -5,6 +5,14 @@ from services.camera_service import CameraManager
 from services.serial_service import SerialCommunicator
 from services.voice_service import EnvironmentLoader, CommandClassifier, VoiceTranscriptionService
 from ml.tool_classifier import ToolClassifier
+import threading
+import time
+import os
+import sys
+
+# Add web directory to path to import web app
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web'))
+from app import run_web_server, shared_state, get_command, emit_status_update
 
 class ControlService:
     def __init__(self):
@@ -20,10 +28,17 @@ class ControlService:
         self.tool_classifier = ToolClassifier()
         self.tool_inventory = ToolInventory()
         self.voice_service = VoiceTranscriptionService(self._process_transcription)
+        
+        # Update shared state with initial inventory
+        shared_state.update_inventory(self.tool_inventory)
     
     def _process_transcription(self, text):
         """Process transcribed text"""
         print(f"Processing transcription: {text}")
+        # Update the shared state with the current transcript
+        shared_state.update_transcript(text)
+        emit_status_update()
+        
         command = self.command_classifier.classify_text(text)
         self.execute_command(command)
     
@@ -31,7 +46,14 @@ class ControlService:
         """Main command execution logic"""
         if command.command_type == CommandType.NOT_A_REQUEST:
             print("Not a request. No action taken.")
+            shared_state.update_command("Idle")
+            emit_status_update()
             return
+        
+        # Update the current command in the shared state
+        current_command = str(command)
+        shared_state.update_command(current_command)
+        emit_status_update()
 
         print("Before command execution:")
         self.tool_inventory.print_inventory()
@@ -43,6 +65,15 @@ class ControlService:
 
         print("After command execution:")
         self.tool_inventory.print_inventory()
+        
+        # Update shared inventory state
+        shared_state.update_inventory(self.tool_inventory)
+        emit_status_update()
+        
+        # Reset the command display after processing
+        time.sleep(2)  # Keep the command visible for a moment
+        shared_state.update_command("Idle")
+        emit_status_update()
     
     def _handle_dispense_command(self, command):
         """Handle tool dispensing logic"""
@@ -105,6 +136,15 @@ class ControlService:
             
             print("Classification failed and no tools are marked as out. Cannot proceed.")
             return None
+    
+    def _check_web_commands(self):
+        """Check for commands from the web interface"""
+        while True:
+            command = get_command()
+            if command:
+                print(f"Executing command from web interface: {command}")
+                self.execute_command(command)
+            time.sleep(0.1)
                         
     def start(self):
         """Start the control service"""
@@ -113,6 +153,16 @@ class ControlService:
         
         print("Initializing serial communicator...")
         self.serial_communicator.initialize()
+        
+        # Start the web server in a separate thread
+        print("Starting web server...")
+        web_thread = threading.Thread(target=run_web_server, daemon=True)
+        web_thread.start()
+        
+        # Start the command checking thread
+        print("Starting web command listener...")
+        command_thread = threading.Thread(target=self._check_web_commands, daemon=True)
+        command_thread.start()
         
         print("Starting voice transcription service...")
         self.voice_service.start()
