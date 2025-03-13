@@ -26,7 +26,7 @@ class Client:
         utils.print_transcript(text)
 
     def __init__(
-    self,
+        self,
         host=None,
         port=None,
         lang=None,
@@ -34,9 +34,6 @@ class Client:
         model="small",
         srt_file_path="output.srt",
         use_vad=True,
-        vad_threshold=0.3,         # Add this parameter
-        vad_min_speech_duration_ms=100,  # Add this parameter
-        vad_silence_duration_ms=500,     # Add this parameter
         callback=None
     ):
         """
@@ -63,13 +60,10 @@ class Client:
         self.server_error = False
         self.srt_file_path = srt_file_path
         self.use_vad = use_vad
-        self.vad_threshold = vad_threshold  # Add this line
-        self.vad_min_speech_duration_ms = vad_min_speech_duration_ms  # Add this line
-        self.vad_silence_duration_ms = vad_silence_duration_ms  # Add this line
         self.last_segment = None
         self.last_received_segment = None
         self.callback = callback if callback is not None else Client.default_callback
-        
+
         if translate:
             self.task = "translate"
 
@@ -199,23 +193,17 @@ class Client:
 
         """
         print("[INFO]: Opened connection")
-        config = {
-        "uid": self.uid,
-        "language": self.language,
-        "task": self.task,
-        "model": self.model,
-        "use_vad": self.use_vad
-        }   
-    
-        # Add VAD parameters if they exist
-        if hasattr(self, 'vad_threshold'):
-            config["vad_config"] = {
-                "threshold": self.vad_threshold,
-                "min_speech_duration_ms": self.vad_min_speech_duration_ms,
-                "silence_duration_ms": self.vad_silence_duration_ms
-            }
-            
-        ws.send(json.dumps(config))
+        ws.send(
+            json.dumps(
+                {
+                    "uid": self.uid,
+                    "language": self.language,
+                    "task": self.task,
+                    "model": self.model,
+                    "use_vad": self.use_vad
+                }
+            )
+        )
 
     def send_packet_to_server(self, message):
         """
@@ -275,7 +263,7 @@ class Client:
         assert self.last_response_received
         while time.time() - self.last_response_received < self.disconnect_if_no_response_for:
             continue
- 
+
 class TranscriptionTeeClient:
     """
     Client for handling audio recording, streaming, and transcription tasks via one or more
@@ -472,44 +460,31 @@ class TranscriptionTeeClient:
         n_audio_file = 0
         if not os.path.exists("chunks"):
             os.makedirs("chunks", exist_ok=True)
-        
-        # Add a buffer reset mechanism
-        last_reset_time = time.time()
-        reset_interval = 5.0  # Reset buffer every 5 seconds to prevent reprocessing
-        
         try:
-            for _ in range(0, int(self.rate / self.chunk * self.record_seconds)):
-                if not self.paused:
-                    if not any(client.recording for client in self.clients):
-                        break
-                    
-                    # Check if it's time to reset the buffer
-                    current_time = time.time()
-                    if current_time - last_reset_time > reset_interval:
-                        self.frames = b""  # Reset the buffer periodically
-                        last_reset_time = current_time
-                        print("[DEBUG]: Resetting audio buffer to prevent reprocessing")
-                    
-                    data = self.stream.read(self.chunk, exception_on_overflow=False)
-                    self.frames += data
+                for _ in range(0, int(self.rate / self.chunk * self.record_seconds)):
+                    if not self.paused:
+                        if not any(client.recording for client in self.clients):
+                            break
+                        data = self.stream.read(self.chunk, exception_on_overflow=False)
+                        self.frames += data
 
-                    audio_array = self.bytes_to_float_array(data)
+                        audio_array = self.bytes_to_float_array(data)
 
-                    self.multicast_packet(audio_array.tobytes())
+                        self.multicast_packet(audio_array.tobytes())
 
-                    # save frames if more than a minute
-                    if len(self.frames) > 60 * self.rate:
-                        t = threading.Thread(
-                            target=self.write_audio_frames_to_file,
-                            args=(
-                                self.frames[:],
-                                f"chunks/{n_audio_file}.wav",
-                            ),
-                        )
-                        t.start()
-                        n_audio_file += 1
-                        self.frames = b""
-                self.write_all_clients_srt()
+                        # save frames if more than a minute
+                        if len(self.frames) > 60 * self.rate:
+                            t = threading.Thread(
+                                target=self.write_audio_frames_to_file,
+                                args=(
+                                    self.frames[:],
+                                    f"chunks/{n_audio_file}.wav",
+                                ),
+                            )
+                            t.start()
+                            n_audio_file += 1
+                            self.frames = b""
+                    self.write_all_clients_srt()
 
         except KeyboardInterrupt:
             if len(self.frames):
@@ -620,24 +595,5 @@ class TranscriptionClient(TranscriptionTeeClient):
         ```
     """
     def __init__(self, host, port, lang=None, translate=False, model="small", use_vad=True, callback = None):
-        self.client = Client(
-        host, 
-        port, 
-        lang, 
-        translate, 
-        model, 
-        srt_file_path="output.srt", 
-        use_vad=use_vad, 
-        vad_threshold=0.3,  # Lower threshold helps detect quieter speech
-        vad_min_speech_duration_ms=100,  # Shorter minimum for commands
-        vad_silence_duration_ms=500,  # Shorter silence before cutting off
-        callback=callback
-        )
+        self.client = Client(host, port, lang, translate, model, srt_file_path="output.srt", use_vad=use_vad, callback = callback)
         TranscriptionTeeClient.__init__(self, [self.client])
-
-    def reset_buffer(self):
-        """Reset the audio buffer to prevent reprocessing the same audio."""
-        if hasattr(self, 'frames'):
-            self.frames = b""
-            print("[DEBUG]: Manually reset audio buffer")
-

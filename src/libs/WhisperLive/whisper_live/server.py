@@ -404,15 +404,10 @@ class ServeClientBase(object):
             frame_np (numpy.ndarray): The audio frame data as a NumPy array.
 
         """
-        # Find the add_frames method in ServeClientBase class and modify:
-
-    def add_frames(self, frame_np):
         self.lock.acquire()
-        # Much more aggressive buffer management - only keep last 10 seconds at most
-        if self.frames_np is not None and self.frames_np.shape[0] > 10*self.RATE:  # Changed from 45 to 10
-            self.frames_offset += 5.0  # Changed from 30 to 5
-            self.frames_np = self.frames_np[int(5*self.RATE):]  # Changed from 30 to 5
-            
+        if self.frames_np is not None and self.frames_np.shape[0] > 45*self.RATE:
+            self.frames_offset += 30.0
+            self.frames_np = self.frames_np[int(30*self.RATE):]
             # check timestamp offset(should be >= self.frame_offset)
             # this basically means that there is no speech as timestamp offset hasnt updated
             # and is less than frame_offset
