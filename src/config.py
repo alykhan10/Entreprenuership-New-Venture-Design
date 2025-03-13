@@ -2,7 +2,7 @@ import os
 from enum import Enum
 
 # File paths
-MODEL_PATH = os.path.join(os.path.dirname(__file__), 'libs', 'classify', 'tool_classifier.pth')
+MODEL_PATH = os.path.join(os.path.dirname(__file__), 'libs', 'classify', 'tool_classifier_new.pth')
 PHOTO_PATH = '/home/orobot/orobot/src/photo.jpg'
 
 # Serial configuration

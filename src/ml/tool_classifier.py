@@ -33,7 +33,7 @@ class ToolClassifier:
             return False
     
     def _load_model(self, model_path, num_classes=4):
-        model = create_model(num_classes=num_classes).to(self.device)
+        model = create_model(num_classes=num_classes, model_name="resnet50").to(self.device)
         model.load_state_dict(torch.load(model_path, map_location=self.device))
         model.eval()  # Set the model to evaluation mode
         return model

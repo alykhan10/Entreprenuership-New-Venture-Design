@@ -41,11 +41,14 @@ class CommandClassifier:
         }
 
     def classify_text(self, transcribed_text):
-        
-        
         # Clean the input text
         transcribed_text = transcribed_text.lower().translate(str.maketrans("", "", string.punctuation)).strip()
         print(f"Transcribed text: {transcribed_text}")
+
+        # NEW: Check for return command first since it takes priority
+        if "return" in transcribed_text and "robot" in transcribed_text:
+            print("Detected return command with priority")
+            return Command("not_a_request return")
 
         # Store the last processed text for better return command detection
         self.last_processed_text = transcribed_text    
@@ -64,16 +67,10 @@ class CommandClassifier:
         - scalpel
         - dissection_clamp
 
-        For example:
-        - dissection clamp may be transcribed as section clamp, clamp, etc. You should still recognize it as a dissection clamp.
-        - curved mayo scissors may be transcibed as curved meiosis, curved scissors, etc. You should still recognize it as a curved mayo scissor.
-        - straight mayo scissors may be transcribed as straight meiosis, straight scissors, etc. You should still recognize it as a straight mayo scissor.
-
         ### Important Rules:
-        - If there are multiple commands or repetitions, just focus on identifying the FIRST complete command
+        - MOST IMPORTANT: If you see both a dispense AND return command, prioritize the return command
+        - If multiple tools are mentioned, focus on identifying the first complete command
         - For comma-separated phrases, treat each part as a potential separate command
-        - Even if the command is repeated, like "robot return, robot return", still extract it
-        - A single word "return" after "robot" is sufficient for a return command
         - Be extremely flexible with recognizing "robot return" variations
 
         ### Response Format:
@@ -84,6 +81,7 @@ class CommandClassifier:
         Process the following transcription:
         "{transcribed_text}"
         """
+    # Continue with the existing processing...
         try:
             response = self.model.generate_content(prompt)
             # Clean the LLM response by removing any markdown formatting, quotes, or backticks
@@ -157,14 +155,14 @@ class VoiceTranscriptionService:
     def __init__(self, callback):
         self.client = None
         self.callback = callback
-        self.last_text = ""
         self.last_command_time = 0
         self.command_cooldown = 3.0
-        self.buffer_reset_interval = 5.0  # Reset buffer every 5 seconds
-        self.last_buffer_reset = time.time()
+        self.last_processed_text = ""  # Store last processed text for deduplication
+        self.current_transcription = ""  # Keep track of the current transcription
         
     def initialize(self):
         try:
+            print("Initializing transcription client...")
             self.client = TranscriptionClient(
                 host="localhost",
                 port=9090,
@@ -174,18 +172,6 @@ class VoiceTranscriptionService:
                 use_vad=True,
                 callback=self._handle_transcription
             )
-            self.client.last_process_time = 0
-            
-            # Override the TranscriptionClient's record method to implement periodic buffer clearing
-            original_record = self.client.record
-            
-            def record_with_buffer_reset(*args, **kwargs):
-                # Periodically reset buffer
-                self.client.frames = b""
-                return original_record(*args, **kwargs)
-                
-            self.client.record = record_with_buffer_reset
-            
             return True
         except Exception as e:
             print(f"Error initializing transcription service: {e}")
@@ -194,65 +180,115 @@ class VoiceTranscriptionService:
     def _handle_transcription(self, text, is_final):
         current_time = time.time()
         
-        # Periodically reset buffer regardless of commands
-        if current_time - self.last_buffer_reset > self.buffer_reset_interval:
-            if hasattr(self.client, 'reset_buffer'):
-                self.client.reset_buffer()
-                print("[AUTO] Buffer reset due to interval")
-            self.last_buffer_reset = current_time
-        
-        if is_final and text and text != self.last_text:
-            # Only process the latest segment from the array
-            latest_text = text[-1] if isinstance(text, list) and text else text
-            
-            # Reset the internal state to prevent contamination
-            self.last_text = ""  # Reset last text instead of storing it
-            
-            # Check if enough time has passed since the last command
-            if current_time - self.last_command_time < self.command_cooldown:
-                print(f"Command rejected - cooldown period ({self.command_cooldown}s) not elapsed")
-                # Still reset buffer even when rejecting command
-                if hasattr(self.client, 'reset_buffer'):
-                    self.client.reset_buffer()
-                    print("[COOLDOWN] Buffer reset when rejecting command")
+        if isinstance(text, list):
+            if not text:  # Empty list
                 return
-                
-            if self.client and hasattr(self.client, 'client'):
-                self.client.client.paused = True
+            # Just use the last segment of text, which is typically the most recent
+            text = text[-1]
+        
+        # Only process final transcriptions
+        if not is_final or not text:
+            return
             
-            # Process the command
-            print(f"\n======= PROCESSING NEW COMMAND: '{latest_text}' =======\n")
-            self.last_command_time = current_time
-            self.callback(latest_text)
+        # Extract only the new part of the transcription
+        if text.startswith(self.current_transcription) and text != self.current_transcription:
+            # Only process the new part that was added
+            new_text = text[len(self.current_transcription):].strip()
+            if new_text:
+                print(f"Extracted new part of transcription: '{new_text}'")
+                latest_text = new_text
+            else:
+                # No new content, probably just minor changes
+                return
+        else:
+            # Complete replacement or unrelated text
+            latest_text = text
             
-            # Multiple aggressive buffer clearing approaches
-            if hasattr(self.client, 'reset_buffer'):
-                self.client.reset_buffer()
+        # Update our current transcription 
+        self.current_transcription = text
+        
+        # Check for separate commands by looking for "robot" keyword
+        # This finds positions of all occurrences of "robot" in the text
+        robot_positions = self._find_all_occurrences(latest_text.lower(), "robot")
+        
+        # If we found more than one "robot" mention, we may have multiple commands
+        if len(robot_positions) > 1:
+            # Split the text into potential separate commands
+            commands = []
+            for i in range(len(robot_positions)):
+                start_pos = robot_positions[i]
                 
-            # Also try to reset parent client's buffer if available
-            if hasattr(self.client, 'client') and hasattr(self.client.client, 'close_websocket'):
-                # Force socket reconnection to clear server-side buffers
-                try:
-                    # Store connection info
-                    host = self.client.client.host
-                    port = self.client.client.port
+                # Determine end position (either next robot or end of string)
+                if i < len(robot_positions) - 1:
+                    end_pos = robot_positions[i + 1]
+                    cmd = latest_text[start_pos:end_pos].strip()
+                else:
+                    cmd = latest_text[start_pos:].strip()
                     
-                    # Close and reconnect
-                    self.client.client.close_websocket()
-                    time.sleep(0.5)  # Short delay to ensure disconnection
-                    
-                    # Reconnect with a new websocket
-                    self.client.client.get_client_socket()
-                    print("[RECONNECT] WebSocket reconnected to clear server-side buffers")
-                except Exception as e:
-                    print(f"Error during websocket reconnection: {e}")
-                    
-            # Force garbage collection
-            import gc
-            gc.collect()
-                    
-            if self.client and hasattr(self.client, 'client'):
-                self.client.client.paused = False
+                commands.append(cmd)
+                
+            # Special case: if the second command contains "return", prioritize it
+            if len(commands) >= 2 and "return" in commands[1].lower():
+                print("Found separate return command - prioritizing it over dispense")
+                latest_text = commands[1]
+        
+        # Skip if this is too similar to the last processed text (likely duplicate)
+        if self._is_duplicate(latest_text, self.last_processed_text):
+            print(f"Skipping duplicate command: '{latest_text}'")
+            return
+
+        # Check if enough time has passed since the last command
+        if current_time - self.last_command_time < self.command_cooldown:
+            print(f"Command rejected - cooldown period ({self.command_cooldown}s) not elapsed")
+            return
+        
+        # Process the command and update last command time
+        print(f"\n======= PROCESSING NEW COMMAND: '{latest_text}' =======\n")
+        self.last_command_time = current_time
+        self.last_processed_text = latest_text  # Save for deduplication
+        self.callback(latest_text)
+        
+        # After processing a command, reset our current transcription to avoid reprocessing
+        self.current_transcription = ""
+        self.last_buffer_reset = current_time
+
+    def _find_all_occurrences(self, text, substring):
+        """Find all starting positions of substring in text"""
+        positions = []
+        pos = text.find(substring)
+        while pos != -1:
+            positions.append(pos)
+            pos = text.find(substring, pos + 1)
+        return positions
+    
+    def _is_duplicate(self, text1, text2):
+        """Check if text1 is likely a duplicate of text2 using simple similarity metric"""
+        # If either is empty, not a duplicate
+        if not text1 or not text2:
+            return False
+            
+        # Clean and normalize texts
+        text1 = text1.lower().strip()
+        text2 = text2.lower().strip()
+        
+        # Exact match is duplicate
+        if text1 == text2:
+            return True
+            
+        # For simple similarity, check percentage of common words
+        words1 = set(text1.split())
+        words2 = set(text2.split())
+        
+        if not words1 or not words2:
+            return False
+            
+        # Calculate Jaccard similarity: intersection over union
+        intersection = len(words1.intersection(words2))
+        union = len(words1.union(words2))
+        
+        similarity = intersection / union if union > 0 else 0
+        
+        return similarity > 0.8  # 80% similarity threshold
     
     def start(self):
         if not self.client:
@@ -260,75 +296,12 @@ class VoiceTranscriptionService:
                 return False
                 
         try:
+            print("Starting transcription client...")
             self.client()  # Start the transcription client
+            print("Transcription client started and running")
             return True
         except Exception as e:
             print(f"Error starting transcription service: {e}")
-            return False
-    def __init__(self, callback):
-        self.client = None
-        self.callback = callback
-        self.last_text = ""
-        self.last_command_time = 0
-        self.command_cooldown = 3.0
-        
-    def initialize(self):
-        try:
-            self.client = TranscriptionClient(
-                host="localhost",
-                port=9090,
-                lang="en",
-                translate=False,
-                model="tiny.en",
-                use_vad=True,
-                callback=self._handle_transcription
-            )
-            self.client.last_process_time = 0
-            return True
-        except Exception as e:
-            print(f"Error initializing transcription service: {e}")
-            return False
-        
-            
-    def _handle_transcription(self, text, is_final):
-        current_time = time.time()
-        
-        if is_final and text and text != self.last_text:
-            self.last_text = text
-            
-            # Check if enough time has passed since the last command
-            if current_time - self.last_command_time < self.command_cooldown:
-                print(f"Command rejected - cooldown period ({self.command_cooldown}s) not elapsed")
-                return
-                
-            if self.client and hasattr(self.client, 'client'):
-                self.client.client.paused = True
-            
-            # Process the latest text segment
-            if text and len(text) > 0:
-                print(f"\n======= PROCESSING NEW COMMAND: '{text[-1]}' =======\n")
-                self.last_command_time = current_time
-                self.callback(text[-1])
-                
-                # Aggressive reset:
-                if hasattr(self.client, 'reset_buffer'):
-                    self.client.reset_buffer()
-                    
-                # Force garbage collection to clean up any lingering references
-                import gc
-                gc.collect()
-                    
-            if self.client and hasattr(self.client, 'client'):
-                self.client.client.paused = False
-    
-    def start(self):
-        if not self.client:
-            if not self.initialize():
-                return False
-                
-        try:
-            self.client()  # Start the transcription client
-            return True
-        except Exception as e:
-            print(f"Error starting transcription service: {e}")
+            import traceback
+            traceback.print_exc()
             return False
