@@ -9,3 +9,5 @@
 ● Identified a Kaggle dataset with 3009 images of grasping, clamping, dissecting and suturing implements               
 ● Generated a 90 second marketing video to show ORobot's value proposition using AI-based storytelling               
 ● Outlined key milestones from prototyping to first sales using a go-to market plan and executive roadmap              
+
+*Note: The following code-base is forked from Connor Johst's work on ORobot.
