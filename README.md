@@ -1,7 +1,7 @@
 # Entreprenuership: New Venture Design (NVD)
 
 ## I. Systems Engineering
-● Designed 'ORobot', a surgical instrument management system to optimize operating room workflows             
+● Designed 'ORobot', a surgical instrument management system to optimize operating room workflows              
 ● Integrated voice recognition with image classification dispensing, retrieval, and tracking of 4 tools                   
 ● Conducted over 30 customer interviews to ensure clinical viability, compliance, and ease of adoption              
 
